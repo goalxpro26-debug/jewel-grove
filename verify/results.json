@@ -1,0 +1,102 @@
+[
+  {
+    "name": "page loads, title state reported",
+    "ok": true,
+    "detail": "{\"screen\":\"title\",\"score\":\"0\",\"moves\":\"0\",\"time\":\"0\",\"tiles\":\"0\",\"drops\":\"0\",\"dropsneed\":\"0\",\"prog\":\"0\",\"hints\":\"0\",\"shuffles\":\"0\",\"level\":\"0\",\"endless\":\"0\",\"auto\":\"0\",\"paused\":\"0\",\"combo\":\"0\",\"specials\":\"0\",\"made\":\"0\",\"used\":\"0\",\"swap\":\"0,0,0,0\",\"nomatch\":\"0,0,0,0\"}"
+  },
+  {
+    "name": "canvas non-blank (title screenshot, distinct colors)",
+    "ok": true,
+    "detail": "distinct=501"
+  },
+  {
+    "name": "level 1 board populated (64 tiles, 25 moves)",
+    "ok": true,
+    "detail": "tiles=64 moves=25"
+  },
+  {
+    "name": "level 1 has a legal swap",
+    "ok": true,
+    "detail": "swap=349,547,411,547"
+  },
+  {
+    "name": "non-matching swap rejected (score 0, moves unchanged)",
+    "ok": true,
+    "detail": "score=0 moves 25 -> 25"
+  },
+  {
+    "name": "matching swap clears tiles (score > 0, moves -1)",
+    "ok": true,
+    "detail": "score=180 moves=24"
+  },
+  {
+    "name": "hint works (hints 3 -> 2)",
+    "ok": false,
+    "detail": "hints=3"
+  },
+  {
+    "name": "shuffle works (shuffles 3 -> 2, tiles still 64)",
+    "ok": false,
+    "detail": "shuffles=3, tiles=64"
+  },
+  {
+    "name": "pause key pauses",
+    "ok": false,
+    "detail": "{\"screen\":\"play\",\"score\":\"180\",\"moves\":\"24\",\"time\":\"0\",\"tiles\":\"64\",\"drops\":\"0\",\"dropsneed\":\"0\",\"prog\":\"0\",\"hints\":\"3\",\"shuffles\":\"3\",\"level\":\"1\",\"endless\":\"0\",\"auto\":\"0\",\"paused\":\"0\",\"combo\":\"0\",\"specials\":\"0\",\"made\":\"0\",\"used\":\"0\",\"swap\":\"163,423,225,423\",\"nomatch\":\"163,547,225,547\"}"
+  },
+  {
+    "name": "pause key resumes",
+    "ok": false,
+    "detail": "{\"screen\":\"play\",\"score\":\"180\",\"moves\":\"24\",\"time\":\"0\",\"tiles\":\"64\",\"drops\":\"0\",\"dropsneed\":\"0\",\"prog\":\"0\",\"hints\":\"3\",\"shuffles\":\"3\",\"level\":\"1\",\"endless\":\"0\",\"auto\":\"0\",\"paused\":\"1\",\"combo\":\"0\",\"specials\":\"0\",\"made\":\"0\",\"used\":\"0\",\"swap\":\"163,423,225,423\",\"nomatch\":\"163,547,225,547\"}"
+  },
+  {
+    "name": "level 1 won by autoplay",
+    "ok": true,
+    "detail": "score=4860 moves=19"
+  },
+  {
+    "name": "score increased during play",
+    "ok": true,
+    "detail": "score=4860"
+  },
+  {
+    "name": "level 2 board populated (64 tiles, clear-type mission)",
+    "ok": true,
+    "detail": "tiles=64 level=2"
+  },
+  {
+    "name": "level 2 (clear 15 Ruby) won by autoplay",
+    "ok": true,
+    "detail": "screen=win prog=15 score=9660"
+  },
+  {
+    "name": "level 3 is a drop mission (2 stars to drop)",
+    "ok": true,
+    "detail": "dropsneed=2 tiles=64"
+  },
+  {
+    "name": "level 3 (drop) won by autoplay, both stars dropped",
+    "ok": true,
+    "detail": "screen=win drops=2 score=940"
+  },
+  {
+    "name": "endless mode scores",
+    "ok": true,
+    "detail": "score 0 -> 180"
+  },
+  {
+    "name": "pause in endless works",
+    "ok": false,
+    "detail": ""
+  },
+  {
+    "name": "mute toggle clickable (no crash)",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "no page/console errors (excluding GD SDK network noise)",
+    "ok": true,
+    "detail": ""
+  }
+]

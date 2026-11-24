@@ -1,0 +1,1252 @@
+-- Jewel Grove: view layer. Owns every screen, the match-3 board, input
+-- (mouse + touch + keyboard), animations, and mission tracking.
+-- The controller (game#game) owns save data, level flow, ads and music.
+-- Swap two adjacent gems to make 3+ in a row/column; matches pop, gems
+-- fall, cascades chain. 4-in-a-row makes a line-clearer, 5-in-a-row a
+-- bomb. Golden stars drop to the bottom row to be collected.
+local audio = require("main.audio")
+local board = require("main.board")
+local levels = require("main.levels")
+
+local W, H = 1136, 640
+local GAME = "game#game"
+local do_hint, do_shuffle
+local SP = board.SPACING
+
+local C = {
+  white   = vmath.vector4(1, 1, 1, 1),
+  ink     = vmath.vector4(0.16, 0.22, 0.16, 1),
+  panel   = vmath.vector4(1, 0.99, 0.92, 1),
+  btn     = vmath.vector4(0.30, 0.62, 0.32, 1),
+  btn2    = vmath.vector4(0.95, 0.65, 0.20, 1),
+  btn_dim = vmath.vector4(0.55, 0.55, 0.55, 1),
+  dim     = vmath.vector4(0, 0, 0, 0.55),
+  danger  = vmath.vector4(0.9, 0.25, 0.25, 1),
+  gold    = vmath.vector4(1, 0.8, 0.25, 1),
+  sel     = vmath.vector4(1, 0.82, 0.35, 1),
+  clear   = vmath.vector4(1, 1, 1, 0),
+}
+
+local TILE_COLOR = {
+  vmath.vector4(0.92, 0.24, 0.33, 1), -- ruby
+  vmath.vector4(0.20, 0.43, 0.92, 1), -- sapphire
+  vmath.vector4(0.18, 0.75, 0.37, 1), -- emerald
+  vmath.vector4(0.96, 0.71, 0.16, 1), -- topaz
+  vmath.vector4(0.61, 0.33, 0.88, 1), -- amethyst
+  vmath.vector4(0.98, 0.94, 0.96, 1), -- pearl
+  vmath.vector4(1, 0.78, 0.24, 1),    -- star
+}
+
+-- ------------------------------------------------------------ node helpers --
+
+local function track(self, node, overlay)
+  if overlay then self.onodes[#self.onodes + 1] = node
+  else self.nodes[#self.nodes + 1] = node end
+  return node
+end
+
+local function new_box(self, overlay, parent, x, y, w, h, color)
+  local n = gui.new_box_node(vmath.vector3(x, y, 0), vmath.vector3(w, h, 0))
+  gui.set_pivot(n, gui.PIVOT_CENTER)
+  gui.set_color(n, color or C.white)
+  if parent then gui.set_parent(n, parent) else track(self, n, overlay) end
+  return n
+end
+
+local function new_img(self, overlay, parent, image, x, y, w, h)
+  local n = new_box(self, overlay, parent, x, y, w, h, C.white)
+  gui.set_texture(n, "atlas")
+  gui.play_flipbook(n, hash(image))
+  return n
+end
+
+local function new_text(self, overlay, parent, str, x, y, scale, color, wrap_w)
+  local n = gui.new_text_node(vmath.vector3(x, y, 0), str or "")
+  gui.set_font(n, "default")
+  gui.set_pivot(n, gui.PIVOT_CENTER)
+  gui.set_scale(n, vmath.vector3(scale or 1, scale or 1, 1))
+  gui.set_color(n, color or C.white)
+  if wrap_w then
+    gui.set_line_break(n, true)
+    gui.set_size(n, vmath.vector3(wrap_w, 4000, 0))
+  end
+  if parent then gui.set_parent(n, parent) else track(self, n, overlay) end
+  return n
+end
+
+local function pick(self, node, cb, overlay)
+  self.pick[#self.pick + 1] = { node = node, cb = cb, overlay = overlay }
+end
+
+local function button(self, overlay, parent, label, x, y, w, h, scale, cb, color)
+  local b = new_box(self, overlay, parent, x, y, w, h, color or C.btn)
+  local t = new_text(self, overlay, b, label, 0, 0, scale or 1.1, C.white)
+  pick(self, b, function()
+    audio.play("sfx_click")
+    cb()
+  end, overlay)
+  return b, t
+end
+
+local function obox(self, parent, x, y, w, h, color)
+  return new_box(self, true, parent, x, y, w, h, color)
+end
+
+local function otext(self, parent, str, x, y, scale, color, wrap_w)
+  return new_text(self, true, parent, str, x, y, scale, color, wrap_w)
+end
+
+local function oimg(self, parent, image, x, y, w, h)
+  return new_img(self, true, parent, image, x, y, w, h)
+end
+
+local function clear_all(self)
+  for _, n in ipairs(self.nodes) do pcall(gui.delete_node, n) end
+  for _, n in ipairs(self.onodes) do pcall(gui.delete_node, n) end
+  self.nodes, self.onodes, self.pick = {}, {}, {}
+  self.bnodes = {}
+  self.rings = {}
+  self.particles = {}
+  self.popups = {}
+  self.hint_nodes = {}
+  self.sel = nil
+  self.resolving = false
+  self.gen = (self.gen or 0) + 1
+end
+
+local function clear_overlay(self)
+  for _, n in ipairs(self.onodes) do pcall(gui.delete_node, n) end
+  self.onodes = {}
+  local keep = {}
+  for _, p in ipairs(self.pick) do
+    if not p.overlay then keep[#keep + 1] = p end
+  end
+  self.pick = keep
+  self.gen = (self.gen or 0) + 1
+end
+
+local function bg(self)
+  new_img(self, false, nil, "background", W / 2, H / 2, W, H)
+end
+
+local function panel(self, w, h)
+  obox(self, nil, 0, 0, W, H, C.dim)
+  local p = obox(self, nil, W / 2, H / 2, w, h, C.panel)
+  gui.set_scale(p, vmath.vector3(0.9, 0.9, 1))
+  gui.animate(p, gui.PROP_SCALE, vmath.vector3(1, 1, 1),
+    gui.EASING_OUTBACK, 0.25)
+  return p
+end
+
+-- ------------------------------------------------------------------ HUD --
+
+local function fmt_time(s)
+  s = math.max(0, math.ceil(s or 0))
+  return string.format("%d:%02d", math.floor(s / 60), s % 60)
+end
+
+local function mission_progress_text(self)
+  local m = self.mission
+  if not m then return "" end
+  if m.type == "score" then
+    return "Score: " .. self.score .. " / " .. m.target
+  elseif m.type == "clear_type" then
+    return levels.GEM_DISPLAY[m.gem] .. ": " .. self.cleared_type ..
+      " / " .. m.target
+  elseif m.type == "drop" then
+    return "Stars: " .. self.drops_collected .. " / " .. m.target
+  elseif m.type == "endless" then
+    return "Best: " .. (self.endless_best or 0)
+  end
+  return ""
+end
+
+local function update_hud(self)
+  if self.hud_score then
+    gui.set_text(self.hud_score, "Score  " .. self.score)
+  end
+  if self.hud_moves then
+    if self.endless then
+      gui.set_text(self.hud_moves, fmt_time(self.time_left))
+      if self.time_left and self.time_left < 30 then
+        gui.set_color(self.hud_moves, C.danger)
+      else
+        gui.set_color(self.hud_moves, C.ink)
+      end
+    else
+      gui.set_text(self.hud_moves, "Moves  " .. (self.moves_left or 0))
+      if (self.moves_left or 0) <= 5 then
+        gui.set_color(self.hud_moves, C.danger)
+      else
+        gui.set_color(self.hud_moves, C.ink)
+      end
+    end
+  end
+  if self.hud_mission then
+    gui.set_text(self.hud_mission, mission_progress_text(self))
+  end
+  if self.side_progress then
+    gui.set_text(self.side_progress, mission_progress_text(self))
+  end
+  if self.side_combo then
+    gui.set_text(self.side_combo,
+      self.cascade >= 2 and ("COMBO x" .. self.cascade) or "")
+  end
+  if self.hint_label then
+    gui.set_text(self.hint_label, "HINT (" .. (self.hints_left or 0) .. ")")
+  end
+  if self.shuffle_label then
+    gui.set_text(self.shuffle_label,
+      "SHUFFLE (" .. (self.shuffles_left or 0) .. ")")
+  end
+end
+
+local function popup(self, x, y, str, color)
+  local n = new_text(self, false, nil, str, x, y, 1.1, color or C.gold)
+  gui.set_scale(n, vmath.vector3(0.6, 0.6, 1))
+  gui.animate(n, gui.PROP_SCALE, vmath.vector3(1.15, 1.15, 1),
+    gui.EASING_OUTBACK, 0.18)
+  self.popups[#self.popups + 1] = { node = n, life = 0.9 }
+end
+
+local function burst(self, x, y, color_idx, n)
+  local col = TILE_COLOR[color_idx] or C.white
+  for i = 1, n or 6 do
+    local a = math.random() * math.pi * 2
+    local sp = 120 + math.random() * 260
+    local node = new_img(self, false, nil, "particle", x, y, 18, 18)
+    gui.set_color(node, col)
+    self.particles[#self.particles + 1] = {
+      node = node, vx = math.cos(a) * sp, vy = math.sin(a) * sp, life = 0.55,
+    }
+  end
+end
+
+local function confetti(self)
+  for i = 1, 46 do
+    local ci = math.random(7)
+    local node = new_img(self, false, nil, "particle",
+      math.random(40, W - 40), H + 20, 20, 20)
+    gui.set_color(node, TILE_COLOR[ci])
+    self.particles[#self.particles + 1] = {
+      node = node, vx = (math.random() - 0.5) * 120,
+      vy = -(140 + math.random() * 160), life = 1.6, confetti = true,
+    }
+  end
+end
+
+-- ---------------------------------------------------------------- screens --
+
+local function show_title(self, data)
+  self.screen = "title"
+  self.paused = false
+  clear_all(self)
+  bg(self)
+  new_img(self, false, nil, "tile_ruby", 150, 520, 84, 84)
+  new_img(self, false, nil, "tile_sapphire", 986, 520, 84, 84)
+  new_img(self, false, nil, "tile_emerald", 110, 400, 64, 64)
+  new_img(self, false, nil, "tile_topaz", 1026, 400, 64, 64)
+  new_img(self, false, nil, "tile_star", 568, 560, 56, 56)
+  new_text(self, false, nil, "Jewel", 568, 514, 3.2, C.ink)
+  new_text(self, false, nil, "GROVE", 568, 440, 2.2, C.btn)
+  new_text(self, false, nil, "Swap gems, match 3 or more, drop the golden stars!",
+    568, 392, 0.95, C.ink)
+  local play = button(self, false, nil, "PLAY", 568, 312, 320, 80, 1.6,
+    function() msg.post(GAME, "ui_play", {}) end, C.btn)
+  gui.animate(play, gui.PROP_SCALE, vmath.vector3(1.06, 1.06, 1),
+    gui.EASING_INOUTSINE, 0.7, 0, nil, gui.PLAYBACK_LOOP_PINGPONG)
+  button(self, false, nil, "LEVELS", 400, 210, 260, 64, 1.2,
+    function() msg.post(GAME, "ui_levels", {}) end, C.btn2)
+  button(self, false, nil, "ENDLESS", 736, 210, 260, 64, 1.2,
+    function() msg.post(GAME, "ui_endless", {}) end, C.btn2)
+  button(self, false, nil, "HOW TO PLAY", 568, 130, 320, 64, 1.2,
+    function() msg.post(GAME, "ui_howto", {}) end)
+  if data.endless_best and data.endless_best > 0 then
+    new_text(self, false, nil, "Endless best: " .. data.endless_best,
+      568, 76, 1.0, C.ink)
+  end
+  new_text(self, false, nil, "An original game by ORQA",
+    568, 36, 0.8, C.ink)
+  self.mute_btn, self.mute_label = button(self, false, nil,
+    (self.muted and "SOUND OFF" or "SOUND ON"), 1030, 600, 150, 48, 0.85,
+    function() msg.post(GAME, "ui_mute", {}) end)
+end
+
+local function show_levels(self, data)
+  self.screen = "levels"
+  self.paused = false
+  clear_all(self)
+  bg(self)
+  new_text(self, false, nil, "Pick a Level", 568, 590, 2.0, C.ink)
+  local unlocked = data.unlocked or 1
+  for i = 1, #levels.LEVELS do
+    local col = (i - 1) % 4
+    local row = math.floor((i - 1) / 4)
+    local x = 218 + col * 240
+    local y = 460 - row * 150
+    local locked = i > unlocked
+    local b = new_box(self, false, nil, x, y, 150, 120,
+      locked and C.btn_dim or C.btn)
+    new_text(self, false, b, tostring(i), 0, 16, 1.8, C.white)
+    if locked then
+      new_img(self, false, b, "lock", 0, -34, 36, 45)
+    else
+      local stars = (data.stars and data.stars[i]) or 0
+      for s = 1, 3 do
+        local st = new_img(self, false, b, "star",
+          (s - 2) * 34, -38, 30, 30)
+        if s > stars then
+          gui.set_color(st, vmath.vector4(0.6, 0.6, 0.6, 0.7))
+        end
+      end
+      pick(self, b, function()
+        audio.play("sfx_click")
+        msg.post(GAME, "ui_pick_level", { level = i })
+      end)
+    end
+  end
+  button(self, false, nil, "BACK", 568, 70, 220, 64, 1.2,
+    function() msg.post(GAME, "ui_quit", {}) end)
+end
+
+-- ------------------------------------------------------------------ board --
+
+local function tile_image(t)
+  if t == board.STAR then return "tile_star" end
+  return "tile_" .. levels.TILE_NAMES[t]
+end
+
+local function tile_node(self, row, col, color, fall_from_y)
+  local x, y = board.cell_pos(self.board, row, col)
+  local key = row .. "," .. col
+  local sp = self.board.special and self.board.special[key]
+  if sp then
+    local ring = new_img(self, false, nil, "ring",
+      x, fall_from_y or y, 72, 72)
+    self.rings[key] = ring
+    if fall_from_y then
+      gui.animate(ring, gui.PROP_POSITION, vmath.vector3(x, y, 0),
+        gui.EASING_OUTBOUNCE, 0.3, 0.02 * (board.ROWS - row))
+    end
+  end
+  local n = new_img(self, false, nil, tile_image(color),
+    x, fall_from_y or y, board.TILE, board.TILE)
+  if fall_from_y then
+    gui.animate(n, gui.PROP_POSITION, vmath.vector3(x, y, 0),
+      gui.EASING_OUTBOUNCE, 0.3, 0.02 * (board.ROWS - row))
+  else
+    gui.set_scale(n, vmath.vector3(0.2, 0.2, 1))
+    gui.animate(n, gui.PROP_SCALE, vmath.vector3(1, 1, 1),
+      gui.EASING_OUTBACK, 0.22)
+  end
+  self.bnodes[key] = n
+  return n
+end
+
+local function build_board_nodes(self, falling)
+  for r = 1, self.board.rows do
+    for c = 1, self.board.cols do
+      local col = board.get(self.board, r, c)
+      if col then
+        if falling then
+          local _, y = board.cell_pos(self.board, r, c)
+          tile_node(self, r, c, col, y + 150)
+        else
+          tile_node(self, r, c, col)
+        end
+      end
+    end
+  end
+end
+
+local function rebuild_board_nodes(self)
+  for _, n in pairs(self.bnodes) do pcall(gui.delete_node, n) end
+  for _, n in pairs(self.rings) do pcall(gui.delete_node, n) end
+  self.bnodes = {}
+  self.rings = {}
+  self.sel = nil
+  build_board_nodes(self, true)
+end
+
+local function refresh_cached_pair(self)
+  local r1, c1, r2, c2 = board.find_swap(self.board)
+  if r1 then
+    local x1, y1 = board.cell_pos(self.board, r1, c1)
+    local x2, y2 = board.cell_pos(self.board, r2, c2)
+    self.cached_pair = { r1 = r1, c1 = c1, r2 = r2, c2 = c2,
+      x1 = x1, y1 = y1, x2 = x2, y2 = y2 }
+  else
+    self.cached_pair = nil
+  end
+  self.cached_nomatch = nil
+  local n1, n2, n3, n4 = board.find_nomatch(self.board)
+  if n1 then
+    local x1, y1 = board.cell_pos(self.board, n1, n2)
+    local x2, y2 = board.cell_pos(self.board, n3, n4)
+    self.cached_nomatch = { x1 = x1, y1 = y1, x2 = x2, y2 = y2 }
+  end
+end
+
+local function set_selected(self, row, col)
+  if self.sel then
+    local old = self.bnodes[self.sel.r .. "," .. self.sel.c]
+    if old then
+      gui.set_scale(old, vmath.vector3(1, 1, 1))
+      gui.set_color(old, C.white)
+    end
+  end
+  self.sel = row and { r = row, c = col } or nil
+  if self.sel then
+    local n = self.bnodes[row .. "," .. col]
+    if n then
+      gui.set_scale(n, vmath.vector3(1.15, 1.15, 1))
+      gui.set_color(n, C.sel)
+    end
+  end
+end
+
+local function pop_tile_node(self, row, col, color)
+  local key = row .. "," .. col
+  local node = self.bnodes[key]
+  self.bnodes[key] = nil
+  local ring = self.rings[key]
+  self.rings[key] = nil
+  if ring then pcall(gui.delete_node, ring) end
+  if node then
+    local x, y = board.cell_pos(self.board, row, col)
+    burst(self, x, y, color, 7)
+    gui.animate(node, gui.PROP_SCALE, vmath.vector3(1.5, 1.5, 1),
+      gui.EASING_OUT, 0.14, 0, function()
+        pcall(gui.delete_node, node)
+      end)
+  end
+end
+
+local function show_play(self, data)
+  self.screen = "play"
+  self.level = data.level or 1
+  self.endless = data.endless or false
+  self.def = data.def
+  self.mission = data.def.mission
+  self.time_left = data.def.time or 0
+  self.moves_left = data.def.moves or 0
+  self.total_moves = data.def.moves or 0
+  self.hints_left = 3
+  self.shuffles_left = 3
+  self.shuffles_used = 0
+  self.score = 0
+  self.combo = 0
+  self.cascade = 0
+  self.cleared_type = 0
+  self.drops_collected = 0
+  self.elapsed = 0
+  self.over = false
+  self.end_pending = nil
+  self.end_timer = 0
+  self.ai_timer = 1.0
+  self.ai_count = 0
+  self.paused = false
+  self.user_paused = false -- a fresh game clears any stale pause state (quit-to-title left it true; ad_resume would otherwise re-pause the game after the next ad)
+  self.sel = nil
+  self.hint_timer = 0
+  self.resolving = false
+  self.resolve_step = nil
+  self.resolve_timer = 0
+  self.pending_special = nil
+  self.anchor = nil
+  clear_all(self)
+  bg(self)
+  -- HUD
+  self.hud_score = new_text(self, false, nil, "Score  0", 100, 610, 1.0, C.ink)
+  -- Single line, no wrap: the side panel shows the full mission text.
+  -- (A wrapped 2nd line dips to y~578 and renders behind the top board row.)
+  new_text(self, false, nil, self.mission.text, 568, 610, 0.85, C.ink)
+  self.hud_mission = new_text(self, false, nil, "", 568, 578, 0.9, C.ink)
+  self.hud_moves = new_text(self, false, nil, "", 950, 610, 1.3, C.ink)
+  button(self, false, nil, "II", 1096, 606, 52, 48, 1.1,
+    function() msg.post(GAME, "ui_pause", {}) end, C.btn2)
+  -- side mission panel
+  local sp = new_box(self, false, nil, 880, 330, 400, 440, C.panel)
+  new_text(self, false, sp, "LEVEL " .. (self.endless and "ENDLESS" or self.level),
+    0, 190, 1.3, C.ink)
+  new_text(self, false, sp, "MISSION", 0, 150, 1.0, C.btn)
+  new_text(self, false, sp, self.mission.text, 0, 108, 1.0, C.ink, 340)
+  self.side_progress = new_text(self, false, sp, "", 0, 52, 1.2, C.ink)
+  self.side_combo = new_text(self, false, sp, "", 0, 0, 1.2, C.gold)
+  new_text(self, false, sp,
+    "Match 4 in a row = line clearer\nMatch 5 in a row = bomb\n" ..
+    "Swap a glowing tile with any\nneighbour to fire it.\n\n" ..
+    "Golden stars drop to the\nbottom row to collect them.",
+    0, -100, 0.85, C.ink, 340)
+  -- bottom buttons
+  local hb, hl = button(self, false, nil, "HINT (3)", 380, 42, 200, 52, 1.1,
+    function() do_hint(self) end, C.btn2)
+  self.hint_btn, self.hint_label = hb, hl
+  local sb, sl = button(self, false, nil, "SHUFFLE (3)", 568, 42, 220, 52, 1.1,
+    function() do_shuffle(self, false) end, C.btn2)
+  self.shuffle_btn, self.shuffle_label = sb, sl
+  button(self, false, nil, "MENU", 756, 42, 160, 52, 1.1,
+    function() msg.post(GAME, "ui_quit", {}) end)
+  -- board
+  local seed = self.endless and 4242 or (self.level * 7919 + 13)
+  self.board = board.new(board.COLS, board.ROWS,
+    data.def.types, data.def.stars or 0, seed)
+  build_board_nodes(self)
+  refresh_cached_pair(self)
+  update_hud(self)
+  -- mission banner
+  local bb = obox(self, nil, W / 2, H / 2 + 60, 640, 100, C.panel)
+  self.banner_node = bb
+  gui.set_scale(bb, vmath.vector3(0.9, 0.9, 1))
+  gui.animate(bb, gui.PROP_SCALE, vmath.vector3(1, 1, 1),
+    gui.EASING_OUTBACK, 0.25)
+  otext(self, bb, "MISSION: " .. self.mission.text, 0, 0, 1.3, C.ink, 580)
+  self.banner_timer = 1.6
+  self.banner_active = true
+end
+
+-- --------------------------------------------------------------- overlays --
+
+local function show_pause(self)
+  self.paused = true
+  clear_overlay(self)
+  local p = panel(self, 460, 460)
+  otext(self, p, "PAUSED", 0, 170, 2.0, C.ink)
+  button(self, true, p, "RESUME", 0, 80, 320, 72, 1.2,
+    function() msg.post(GAME, "ui_resume", {}) end)
+  button(self, true, p, "RESTART", 0, -10, 320, 72, 1.2,
+    function() msg.post(GAME, "ui_retry", {}) end, C.btn2)
+  button(self, true, p, "SOUND: " .. (self.muted and "OFF" or "ON"),
+    0, -100, 320, 72, 1.2,
+    function() msg.post(GAME, "ui_mute", {}) end, C.btn2)
+  button(self, true, p, "QUIT TO TITLE", 0, -180, 320, 64, 1.1,
+    function() msg.post(GAME, "ui_quit", {}) end)
+end
+
+local function show_win(self, data)
+  self.screen = "win"
+  clear_overlay(self)
+  confetti(self)
+  audio.play("sfx_mission")
+  local p = panel(self, 520, 600)
+  otext(self, p, "LEVEL COMPLETE!", 0, 220, 1.7, C.btn)
+  otext(self, p, "Mission complete!", 0, 172, 1.1, C.ink)
+  for s = 1, 3 do
+    local st = oimg(self, p, "star", (s - 2) * 90, 92, 72, 72)
+    gui.set_scale(st, vmath.vector3(0.2, 0.2, 1))
+    if s <= (data.stars or 1) then
+      gui.animate(st, gui.PROP_SCALE, vmath.vector3(1, 1, 1),
+        gui.EASING_OUTBACK, 0.35, 0.15 + s * 0.18)
+    else
+      gui.set_color(st, vmath.vector4(0.6, 0.6, 0.6, 0.7))
+      gui.animate(st, gui.PROP_SCALE, vmath.vector3(1, 1, 1),
+        gui.EASING_OUTBACK, 0.35, 0.15 + s * 0.18)
+    end
+  end
+  otext(self, p, "Score  " .. (data.score or 0), 0, 8, 1.3, C.ink)
+  local y = -82
+  if data.has_next then
+    button(self, true, p, "NEXT LEVEL", 0, y, 340, 76, 1.3,
+      function() msg.post(GAME, "ui_next", {}) end)
+    y = y - 85
+  end
+  button(self, true, p, "REPLAY", 0, y, 340, 72, 1.2,
+    function() msg.post(GAME, "ui_retry", {}) end, C.btn2)
+  button(self, true, p, "LEVELS", 0, y - 85, 340, 72, 1.2,
+    function() msg.post(GAME, "ui_levels", {}) end, C.btn2)
+end
+
+local function show_lose(self, data)
+  self.screen = "lose"
+  clear_overlay(self)
+  local p = panel(self, 520, 460)
+  otext(self, p, self.endless and "TIME UP!" or "OUT OF MOVES!", 0, 170, 1.9, C.danger)
+  if data.endless then
+    otext(self, p, "The grove wins this round!", 0, 115, 1.1, C.ink)
+    otext(self, p, "Score  " .. (data.score or 0), 0, 55, 1.3, C.ink)
+    otext(self, p, "Best  " .. (data.best or 0), 0, 5, 1.1, C.ink)
+  else
+    otext(self, p, data.reason or "Out of moves - try again!", 0, 115, 1.1, C.ink)
+    otext(self, p, "Score  " .. (data.score or 0), 0, 55, 1.3, C.ink)
+  end
+  button(self, true, p, "TRY AGAIN", 0, -70, 340, 76, 1.3,
+    function() msg.post(GAME, "ui_retry", {}) end)
+  button(self, true, p, "LEVELS", 0, -160, 340, 72, 1.2,
+    function() msg.post(GAME, "ui_levels", {}) end, C.btn2)
+end
+
+local function show_howto(self)
+  clear_overlay(self)
+  local p = panel(self, 700, 520)
+  otext(self, p, "HOW TO PLAY", 0, 210, 1.8, C.ink)
+  otext(self, p,
+    "Tap a gem, then tap an adjacent gem to swap them.\n\n" ..
+    "Make a row or column of 3 or more matching gems to clear " ..
+    "them. Gems above fall down and new gems drop in - chains " ..
+    "score extra points!\n\n" ..
+    "Match 4 in a row to make a line clearer, 5 in a row to " ..
+    "make a bomb. Swap a glowing special tile with any neighbour " ..
+    "to fire it.\n\n" ..
+    "Golden stars cannot match - swap them downwards until they " ..
+    "reach the bottom row to collect them.\n\n" ..
+    "Finish the mission before your moves run out. HINT shows a " ..
+    "good swap. SHUFFLE mixes the gems when you are stuck.\n\n" ..
+    "Keys: H hint, S shuffle, P pause.",
+    0, -30, 1.05, C.ink, 620)
+  button(self, true, p, "GOT IT", 0, -210, 300, 64, 1.2,
+    function() clear_overlay(self) end)
+end
+
+-- ------------------------------------------------------------ game actions --
+
+local function stars_for(self)
+  if self.endless or self.total_moves <= 0 then return 1 end
+  local frac = self.moves_left / self.total_moves
+  if frac >= 0.5 then return 3 end
+  if frac >= 0.25 then return 2 end
+  return 1
+end
+
+local function mission_won(self)
+  local m = self.mission
+  if m.type == "score" then return self.score >= m.target
+  elseif m.type == "clear_type" then return self.cleared_type >= m.target
+  elseif m.type == "drop" then return self.drops_collected >= m.target
+  end
+  return false
+end
+
+local function check_end(self)
+  if self.over then return end
+  if self.endless then return end
+  if mission_won(self) then
+    self.over = true
+    self.end_pending = "win"
+    self.end_timer = 1.1
+    confetti(self)
+    audio.play("sfx_mission")
+    return
+  end
+  if (self.moves_left or 0) <= 0 then
+    self.over = true
+    self.end_pending = "lose"
+    self.end_reason = "Out of moves - try again!"
+    self.end_timer = 0.9
+  end
+end
+
+local function check_stuck(self)
+  if self.over or self.endless then return end
+  if not self.cached_pair and board.count_stars(self.board) == 0 then
+    popup(self, W / 2, 340, "No moves - free shuffle!", C.gold)
+    board.shuffle_tiles(self.board)
+    rebuild_board_nodes(self)
+    refresh_cached_pair(self)
+    audio.play("sfx_shuffle")
+  end
+end
+
+-- Snapshot the grid types so cleared cells can be scored by type.
+local function snapshot_types(self)
+  local snap = {}
+  for r = 1, self.board.rows do
+    snap[r] = {}
+    for c = 1, self.board.cols do
+      snap[r][c] = board.get(self.board, r, c)
+    end
+  end
+  return snap
+end
+
+local function score_cleared(self, snap, cleared, mult)
+  local pts = 0
+  for _, cell in ipairs(cleared) do
+    local t = snap[cell[1]] and snap[cell[1]][cell[2]]
+    pts = pts + 60 * mult
+    if t == board.STAR then
+      pts = pts + 40
+    elseif self.mission.type == "clear_type" and t == self.mission.gem then
+      self.cleared_type = self.cleared_type + 1
+    end
+  end
+  return pts
+end
+
+-- One cascade step: resolve matches, pop tiles, score, maybe make a special.
+-- Returns true if anything matched.
+local function cascade_resolve_step(self)
+  if not board.has_match(self.board) then return false end
+  self.cascade = self.cascade + 1
+  local snap = snapshot_types(self)
+  local ar, ac = nil, nil
+  if self.anchor then ar, ac = self.anchor.r, self.anchor.c end
+  local cleared, triggered, created, nmatched =
+    board.resolve_matches(self.board, ar, ac)
+  local pts = score_cleared(self, snap, cleared, self.cascade)
+  for _, cell in ipairs(cleared) do
+    local t = snap[cell[1]][cell[2]] or 1
+    pop_tile_node(self, cell[1], cell[2], t)
+  end
+  self.score = self.score + pts
+  if created then
+    local x, y = board.cell_pos(self.board, created.r, created.c)
+    if created.kind == "bomb" then
+      popup(self, x, y + 40, "BOMB!", C.gold)
+    else
+      popup(self, x, y + 40, "LINE CLEARER!", C.gold)
+    end
+    audio.play("sfx_special")
+    self.specials_made = (self.specials_made or 0) + 1
+  elseif #triggered > 0 then
+    audio.play("sfx_special")
+    self.specials_used = (self.specials_used or 0) + #triggered
+    popup(self, W / 2, 420, "SPECIAL!", C.gold)
+  elseif self.cascade >= 2 then
+    audio.play("sfx_cascade")
+    popup(self, W / 2, 420, "CASCADE x" .. self.cascade, C.gold)
+  else
+    audio.play("sfx_match")
+  end
+  if self.cascade >= 2 then
+    popup(self, W / 2, 380, "+" .. pts, C.gold)
+  else
+    popup(self, W / 2, 380, "+" .. pts, C.gold)
+  end
+  refresh_cached_pair(self)
+  update_hud(self)
+  return true
+end
+
+local function begin_resolution(self, anchor_r, anchor_c, pending_special)
+  self.resolving = true
+  self.cascade = 0
+  self.anchor = anchor_r and { r = anchor_r, c = anchor_c } or nil
+  self.pending_special = pending_special
+  self.resolve_step = pending_special and "special" or "resolve"
+  self.resolve_timer = 0.25
+end
+
+-- Drive the resolution state machine from update().
+local function tick_resolution(self, dt)
+  if not self.resolving then return end
+  self.resolve_timer = self.resolve_timer - dt
+  if self.resolve_timer > 0 then return end
+  if self.resolve_step == "special" then
+    local sp = self.pending_special
+    self.pending_special = nil
+    local snap = snapshot_types(self)
+    local cleared, triggered = board.clear_cells(self.board, { { sp.r, sp.c } })
+    local pts = score_cleared(self, snap, cleared, 1) + 150
+    for _, cell in ipairs(cleared) do
+      local t = snap[cell[1]][cell[2]] or 1
+      pop_tile_node(self, cell[1], cell[2], t)
+    end
+    self.score = self.score + pts
+    self.specials_used = (self.specials_used or 0) + 1
+    audio.play("sfx_special")
+    popup(self, W / 2, 420, "SPECIAL!  +" .. pts, C.gold)
+    self.resolve_step = "gravity"
+    self.resolve_timer = 0.35
+    update_hud(self)
+    return
+  end
+  if self.resolve_step == "resolve" then
+    if cascade_resolve_step(self) then
+      self.resolve_step = "gravity"
+      self.resolve_timer = 0.35
+    else
+      -- no more matches: done resolving
+      self.resolving = false
+      self.resolve_step = nil
+      self.cascade = 0
+      refresh_cached_pair(self)
+      update_hud(self)
+      check_end(self)
+      if not self.over then check_stuck(self) end
+    end
+    return
+  end
+  if self.resolve_step == "gravity" then
+    board.apply_gravity(self.board)
+    local got = board.collect_bottom_stars(self.board)
+    if got > 0 then
+      self.drops_collected = self.drops_collected + got
+      self.score = self.score + got * 200
+      audio.play("sfx_drop")
+      popup(self, W / 2, 300, "STAR DROPPED!  +" .. (got * 200), C.gold)
+    end
+    rebuild_board_nodes(self)
+    refresh_cached_pair(self)
+    update_hud(self)
+    self.resolve_step = "resolve"
+    self.resolve_timer = 0.3
+    return
+  end
+end
+
+-- Animate the two tile nodes swapping places, then start resolution.
+local function animate_swap(self, r1, c1, r2, c2)
+  local k1, k2 = r1 .. "," .. c1, r2 .. "," .. c2
+  local n1, n2 = self.bnodes[k1], self.bnodes[k2]
+  local x1, y1 = board.cell_pos(self.board, r1, c1)
+  local x2, y2 = board.cell_pos(self.board, r2, c2)
+  if n1 and n2 then
+    gui.animate(n1, gui.PROP_POSITION, vmath.vector3(x2, y2, 0),
+      gui.EASING_OUT, 0.16)
+    gui.animate(n2, gui.PROP_POSITION, vmath.vector3(x1, y1, 0),
+      gui.EASING_OUT, 0.16)
+    self.bnodes[k1], self.bnodes[k2] = n2, n1
+    local ring1, ring2 = self.rings[k1], self.rings[k2]
+    if ring1 or ring2 then
+      if ring1 then
+        gui.animate(ring1, gui.PROP_POSITION, vmath.vector3(x2, y2, 0),
+          gui.EASING_OUT, 0.16)
+      end
+      if ring2 then
+        gui.animate(ring2, gui.PROP_POSITION, vmath.vector3(x1, y1, 0),
+          gui.EASING_OUT, 0.16)
+      end
+      self.rings[k1], self.rings[k2] = ring2, ring1
+    end
+  end
+  set_selected(self, nil)
+end
+
+local function do_swap(self, r1, c1, r2, c2)
+  if self.screen ~= "play" or self.paused or self.over or self.resolving then
+    return false
+  end
+  local res = board.try_swap(self.board, r1, c1, r2, c2)
+  if not res then
+    audio.play("sfx_nomatch")
+    -- shake both tiles to show the rejection
+    for _, cell in ipairs({ { r1, c1 }, { r2, c2 } }) do
+      local n = self.bnodes[cell[1] .. "," .. cell[2]]
+      if n then
+        local x, y = board.cell_pos(self.board, cell[1], cell[2])
+        gui.animate(n, gui.PROP_POSITION, vmath.vector3(x + 6, y, 0),
+          gui.EASING_OUT, 0.07, 0, function()
+            gui.animate(n, gui.PROP_POSITION, vmath.vector3(x, y, 0),
+              gui.EASING_OUT, 0.07)
+          end)
+      end
+    end
+    return false
+  end
+  if not self.endless then
+    self.moves_left = self.moves_left - 1
+  end
+  audio.play("sfx_swap")
+  if res.kind == "special" then
+    begin_resolution(self, nil, nil, { r = res.r, c = res.c })
+  elseif res.kind == "star" then
+    animate_swap(self, r1, c1, r2, c2)
+    -- a star may now sit on the bottom row: collect + refill, then cascades
+    local got = board.collect_bottom_stars(self.board)
+    if got > 0 then
+      self.drops_collected = self.drops_collected + got
+      self.score = self.score + got * 200
+      audio.play("sfx_drop")
+      popup(self, W / 2, 300, "STAR DROPPED!  +" .. (got * 200), C.gold)
+      rebuild_board_nodes(self)
+    end
+    begin_resolution(self, nil, nil, nil)
+  else
+    animate_swap(self, r1, c1, r2, c2)
+    begin_resolution(self, r2, c2, nil)
+  end
+  update_hud(self)
+  return true
+end
+
+local function tap_tile(self, row, col)
+  if self.screen ~= "play" or self.paused or self.over or self.resolving then
+    return
+  end
+  local t = board.get(self.board, row, col)
+  if not t then return end
+  if self.sel and self.sel.r == row and self.sel.c == col then
+    set_selected(self, nil)
+    return
+  end
+  if self.sel then
+    local sr, sc = self.sel.r, self.sel.c
+    if math.abs(sr - row) + math.abs(sc - col) == 1 then
+      local ok = do_swap(self, sr, sc, row, col)
+      if not ok then set_selected(self, row, col) end
+      return
+    end
+    -- not adjacent: move the selection to the new tile
+    audio.play("sfx_select")
+    set_selected(self, row, col)
+    return
+  end
+  audio.play("sfx_select")
+  set_selected(self, row, col)
+end
+
+do_hint = function(self)
+  if self.screen ~= "play" or self.paused or self.over or self.resolving then
+    return
+  end
+  if (self.hints_left or 0) <= 0 then
+    popup(self, W / 2, 340, "No hints left!", C.danger)
+    return
+  end
+  refresh_cached_pair(self)
+  local p = self.cached_pair
+  if not p then return end
+  self.hints_left = self.hints_left - 1
+  audio.play("sfx_hint")
+  self.hint_nodes = {}
+  for _, cell in ipairs({ { p.r1, p.c1 }, { p.r2, p.c2 } }) do
+    local n = self.bnodes[cell[1] .. "," .. cell[2]]
+    if n then
+      gui.set_scale(n, vmath.vector3(1.3, 1.3, 1))
+      gui.set_color(n, C.sel)
+      self.hint_nodes[#self.hint_nodes + 1] = n
+    end
+  end
+  self.hint_timer = 1.2
+  update_hud(self)
+end
+
+do_shuffle = function(self, free)
+  if self.screen ~= "play" or self.paused or self.over or self.resolving then
+    return
+  end
+  if not free and (self.shuffles_left or 0) <= 0 then
+    popup(self, W / 2, 340, "No shuffles left!", C.danger)
+    return
+  end
+  if not free then
+    self.shuffles_left = self.shuffles_left - 1
+    self.shuffles_used = self.shuffles_used + 1
+  end
+  board.shuffle_tiles(self.board)
+  rebuild_board_nodes(self)
+  refresh_cached_pair(self)
+  audio.play("sfx_shuffle")
+  update_hud(self)
+end
+
+-- ------------------------------------------------------------------ input --
+
+function on_input(self, action_id, action)
+  if action_id == hash("touch") then
+    if action.pressed then
+      -- Topmost UI first: overlay buttons are added after the play
+      -- screen buttons, so iterate in reverse. (Without this, the win
+      -- screen's LEVELS button at y=68 is shadowed by the play screen's
+      -- SHUFFLE button, whose top edge is also y=68, and the click is
+      -- swallowed with no effect.)
+      for i = #self.pick, 1, -1 do
+        local p = self.pick[i]
+        if gui.pick_node(p.node, action.x, action.y) then
+          p.cb()
+          return
+        end
+      end
+      if self.screen == "play" and not self.paused and not self.over then
+        for key, node in pairs(self.bnodes) do
+          if gui.pick_node(node, action.x, action.y) then
+            local r, c = key:match("^(%d+),(%d+)$")
+            tap_tile(self, tonumber(r), tonumber(c))
+            return
+          end
+        end
+        set_selected(self, nil)
+      end
+    end
+  elseif action_id == hash("pause_key") then
+    if action.pressed then
+      if self.user_paused then
+        msg.post(GAME, "ui_resume", {})
+      elseif self.screen == "play" then
+        msg.post(GAME, "ui_pause", {})
+      end
+    end
+  elseif action_id == hash("hint_key") then
+    if action.pressed then do_hint(self) end
+  elseif action_id == hash("shuffle_key") then
+    if action.pressed then do_shuffle(self, false) end
+  elseif action_id == hash("autoplay") then
+    if action.pressed then
+      self.autoplay = not self.autoplay
+      print("autoplay", self.autoplay)
+    end
+  end
+end
+
+-- ----------------------------------------------------------------- update --
+
+local function report_state(self)
+  if html5 then
+    local tiles = self.board and board.count(self.board) or 0
+    local swap = "0,0,0,0"
+    local nomatch = "0,0,0,0"
+    if self.cached_nomatch then
+      local nm = self.cached_nomatch
+      nomatch = math.floor(nm.x1) .. "," .. math.floor(nm.y1) .. "," ..
+                math.floor(nm.x2) .. "," .. math.floor(nm.y2)
+    end
+    if self.cached_pair then
+      local p = self.cached_pair
+      swap = math.floor(p.x1) .. "," .. math.floor(p.y1) .. "," ..
+             math.floor(p.x2) .. "," .. math.floor(p.y2)
+    end
+    local specials = 0
+    if self.board and self.board.special then
+      for _ in pairs(self.board.special) do specials = specials + 1 end
+    end
+    pcall(html5.run, "document.title='JEWELGROVE|screen=" .. self.screen ..
+      "|score=" .. (self.score or 0) ..
+      "|moves=" .. (self.moves_left or 0) ..
+      "|time=" .. math.floor(self.time_left or 0) ..
+      "|tiles=" .. tiles ..
+      "|drops=" .. (self.drops_collected or 0) ..
+      "|dropsneed=" .. ((self.mission and self.mission.type == "drop") and self.mission.target or 0) ..
+      "|prog=" .. (self.mission and self.mission.type == "clear_type" and self.cleared_type or 0) ..
+      "|hints=" .. (self.hints_left or 0) ..
+      "|shuffles=" .. (self.shuffles_left or 0) ..
+      "|level=" .. (self.level or 0) ..
+      "|endless=" .. (self.endless and 1 or 0) ..
+      "|auto=" .. (self.autoplay and 1 or 0) ..
+      "|paused=" .. (self.paused and 1 or 0) ..
+      "|combo=" .. (self.combo or 0) ..
+      "|specials=" .. specials ..
+      "|made=" .. (self.specials_made or 0) ..
+      "|used=" .. (self.specials_used or 0) ..
+      "|swap=" .. swap ..
+      "|nomatch=" .. nomatch .. "'")
+  end
+end
+
+function update(self, dt)
+  self.report_t = (self.report_t or 0) + dt
+  if self.report_t > 0.5 then
+    self.report_t = 0
+    report_state(self)
+  end
+  if self.banner_active and self.banner_timer then
+    self.banner_timer = self.banner_timer - dt
+    if self.banner_timer <= 0 then
+      self.banner_active = false
+      self.banner_timer = nil
+      -- Delete the banner node directly: during an ad the game is paused
+      -- when this timer fires, and the old clear_overlay call was gated
+      -- on not-paused, so a pre-roll ad left the banner covering the
+      -- board for the whole level. Deleting the banner while paused is
+      -- safe (it is informational only). Same latent bug exists in the
+      -- GD build; fixed here for the GamePix build.
+      if self.banner_node then
+        pcall(gui.delete_node, self.banner_node)
+        self.banner_node = nil
+      end
+    end
+  end
+  if self.paused then return end
+  -- hint flash expiry
+  if self.hint_timer and self.hint_timer > 0 then
+    self.hint_timer = self.hint_timer - dt
+    if self.hint_timer <= 0 then
+      for _, n in ipairs(self.hint_nodes) do
+        pcall(gui.set_scale, n, vmath.vector3(1, 1, 1))
+        pcall(gui.set_color, n, C.white)
+      end
+      self.hint_nodes = {}
+    end
+  end
+  -- particles
+  for i = #self.particles, 1, -1 do
+    local p = self.particles[i]
+    p.life = p.life - dt
+    if p.life <= 0 then
+      pcall(gui.delete_node, p.node)
+      table.remove(self.particles, i)
+    else
+      local pos = gui.get_position(p.node)
+      if p.confetti then
+        p.vy = p.vy - 60 * dt
+        pos.x = pos.x + p.vx * dt + math.sin(p.life * 9) * 30 * dt
+      else
+        p.vy = p.vy - 900 * dt
+        pos.x = pos.x + p.vx * dt
+      end
+      pos.y = pos.y + p.vy * dt
+      gui.set_position(p.node, pos)
+      local c = gui.get_color(p.node)
+      c.w = math.max(0, math.min(1, p.life / 0.5))
+      gui.set_color(p.node, c)
+    end
+  end
+  -- score popups
+  for i = #self.popups, 1, -1 do
+    local p = self.popups[i]
+    p.life = p.life - dt
+    if p.life <= 0 then
+      pcall(gui.delete_node, p.node)
+      table.remove(self.popups, i)
+    else
+      local pos = gui.get_position(p.node)
+      pos.y = pos.y + 42 * dt
+      gui.set_position(p.node, pos)
+      local c = gui.get_color(p.node)
+      c.w = math.max(0, p.life / 0.9)
+      gui.set_color(p.node, c)
+    end
+  end
+  if self.screen ~= "play" then return end
+  -- resolution state machine (matches, gravity, cascades)
+  tick_resolution(self, dt)
+  if self.resolving then return end
+  -- countdown (endless only; levels are move-limited)
+  if self.endless and not self.over then
+    self.elapsed = self.elapsed + dt
+    self.time_left = self.time_left - dt
+    if self.time_left <= 0 then
+      self.time_left = 0
+      update_hud(self)
+      self.over = true
+      self.end_pending = "lose"
+      self.end_reason = "Out of time - try again!"
+      self.end_timer = 0.9
+    elseif math.floor(self.time_left) ~= math.floor(self.time_left + dt) then
+      update_hud(self)
+    end
+  end
+  -- win/lose delay, then hand over to the controller
+  if self.end_pending then
+    self.end_timer = self.end_timer - dt
+    if self.end_timer <= 0 then
+      local pending = self.end_pending
+      local reason = self.end_reason
+      self.end_pending = nil
+      self.end_reason = nil
+      if pending == "win" then
+        msg.post(GAME, "ui_level_won",
+          { score = self.score, stars = stars_for(self) })
+      else
+        msg.post(GAME, "ui_level_lost",
+          { score = self.score, reason = reason })
+      end
+    end
+  end
+  -- autoplay (verification aid): play the hint swap; nudge stars down
+  -- so drop levels progress: a star in the bottom half (or when moves
+  -- run low, or every 2nd move) is swapped down before matching.
+  if self.autoplay and not self.over and self.screen == "play" then
+    self.ai_timer = (self.ai_timer or 0) - dt
+    if self.ai_timer <= 0 then
+      self.ai_timer = 0.9
+      self.ai_count = (self.ai_count or 0) + 1
+      refresh_cached_pair(self)
+      local acted = false
+      -- lowest star with a plain gem below it (never swap onto a special)
+      local sr, sc = nil, nil
+      for r = self.board.rows - 1, 1, -1 do
+        for c = 1, self.board.cols do
+          if board.get(self.board, r, c) == board.STAR then
+            local below = board.get(self.board, r + 1, c)
+            local sp_below = self.board.special and
+              self.board.special[(r + 1) .. "," .. c]
+            if below and below ~= board.STAR and not sp_below then
+              sr, sc = r, c
+              break
+            end
+          end
+        end
+        if sr then break end
+      end
+      local p = self.cached_pair
+      if sr and (sr >= 5 or (self.moves_left or 99) <= 8 or not p or
+                 self.ai_count % 2 == 0) then
+        acted = do_swap(self, sr, sc, sr + 1, sc)
+      end
+      if not acted and p then
+        acted = do_swap(self, p.r1, p.c1, p.r2, p.c2)
+      end
+      if not acted then
+        if (self.shuffles_left or 0) > 0 then
+          do_shuffle(self, false)
+        else
+          do_shuffle(self, true)
+        end
+      end
+    end
+  end
+end
+
+-- --------------------------------------------------------------- messages --
+
+function on_message(self, message_id, message, sender)
+  if message_id == hash("show_title") then
+    self.muted = message.muted or false
+    self.endless_best = message.endless_best or 0
+    show_title(self, message)
+  elseif message_id == hash("show_levels") then
+    self.muted = message.muted or false
+    show_levels(self, message)
+  elseif message_id == hash("show_play") then
+    self.muted = message.muted or false
+    show_play(self, message)
+  elseif message_id == hash("show_win") then
+    show_win(self, message)
+  elseif message_id == hash("show_lose") then
+    show_lose(self, message)
+  elseif message_id == hash("show_howto") then
+    show_howto(self)
+  elseif message_id == hash("show_pause") then
+    self.user_paused = true
+    self.banner_active = false
+    show_pause(self)
+  elseif message_id == hash("hide_pause") then
+    self.user_paused = false
+    self.paused = false
+    clear_overlay(self)
+  elseif message_id == hash("ad_pause") then
+    self.paused = true
+  elseif message_id == hash("ad_resume") then
+    self.paused = self.user_paused or false
+  elseif message_id == hash("set_mute") then
+    self.muted = message.muted
+    if self.mute_label then
+      gui.set_text(self.mute_label,
+        self.muted and "SOUND OFF" or "SOUND ON")
+    end
+  end
+end
+
+-- -------------------------------------------------------------------- init --
+
+function init(self)
+  msg.post(".", "acquire_input_focus")
+  self.nodes = {}
+  self.onodes = {}
+  self.pick = {}
+  self.bnodes = {}
+  self.rings = {}
+  self.particles = {}
+  self.popups = {}
+  self.hint_nodes = {}
+  self.screen = "title"
+  self.muted = false
+  self.autoplay = false
+  self.paused = false
+  self.user_paused = false
+  self.over = false
+  self.score = 0
+  self.moves_left = 0
+  self.time_left = 0
+  self.report_t = 0
+  self.ai_timer = 1.0
+  self.ai_count = 0
+  self.elapsed = 0
+  self.combo = 0
+  self.cascade = 0
+  self.cleared_type = 0
+  self.drops_collected = 0
+  self.specials_made = 0
+  self.specials_used = 0
+  self.resolving = false
+end

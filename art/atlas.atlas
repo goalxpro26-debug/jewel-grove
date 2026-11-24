@@ -1,0 +1,39 @@
+images {
+  image: "/art/background.png"
+}
+images {
+  image: "/art/tile_ruby.png"
+}
+images {
+  image: "/art/tile_sapphire.png"
+}
+images {
+  image: "/art/tile_emerald.png"
+}
+images {
+  image: "/art/tile_topaz.png"
+}
+images {
+  image: "/art/tile_amethyst.png"
+}
+images {
+  image: "/art/tile_pearl.png"
+}
+images {
+  image: "/art/tile_star.png"
+}
+images {
+  image: "/art/particle.png"
+}
+images {
+  image: "/art/star.png"
+}
+images {
+  image: "/art/lock.png"
+}
+images {
+  image: "/art/ring.png"
+}
+margin: 0
+extrude_borders: 2
+inner_padding: 0
